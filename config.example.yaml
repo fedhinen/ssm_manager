@@ -10,3 +10,23 @@ targets:
     region: us-east-1
     host: redis.example.cache.amazonaws.com
     remote_port: 6379
+
+# Bookmarks are normally created after a dynamic session ends. They can also be
+# declared manually.
+bookmarks:
+  - name: api-shell
+    type: shell
+    profile: development
+    region: us-east-1
+    instance_id: i-0123456789abcdef0
+    instance_name: api-dev
+
+  - name: orders-local
+    type: remote-host
+    profile: development
+    region: us-east-1
+    instance_id: i-0123456789abcdef0
+    instance_name: bastion-dev
+    host: orders.cluster.example.us-east-1.rds.amazonaws.com
+    remote_port: 5432
+    local_port: 15432

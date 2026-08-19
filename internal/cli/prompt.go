@@ -73,3 +73,24 @@ func (p *Prompter) Port(label string, defaultPort int) (int, error) {
 		fmt.Fprintln(p.out, "Enter a port between 1 and 65535.")
 	}
 }
+
+func (p *Prompter) Confirm(label string, defaultValue bool) (bool, error) {
+	defaultText := "y"
+	if !defaultValue {
+		defaultText = "n"
+	}
+	for {
+		answer, err := p.Text(label+" (y/n)", defaultText)
+		if err != nil {
+			return false, err
+		}
+		switch strings.ToLower(answer) {
+		case "y", "yes":
+			return true, nil
+		case "n", "no":
+			return false, nil
+		default:
+			fmt.Fprintln(p.out, "Enter y or n.")
+		}
+	}
+}

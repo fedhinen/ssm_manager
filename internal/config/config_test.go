@@ -46,3 +46,60 @@ func TestConfig_TargetsFor(t *testing.T) {
 		t.Fatalf("TargetsFor() returned %d targets, want 2", len(targets))
 	}
 }
+
+func TestSave(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "nested", "config.yaml")
+	cfg := Config{
+		Targets: []Target{},
+		Bookmarks: []Bookmark{
+			{
+				Name:         "orders",
+				Type:         SessionTypeRemoteHost,
+				Profile:      "dev",
+				Region:       "us-east-1",
+				InstanceID:   "i-001",
+				InstanceName: "bastion",
+				Host:         "orders.internal",
+				RemotePort:   5432,
+				LocalPort:    15432,
+			},
+		},
+	}
+
+	if err := Save(path, cfg); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(loaded.Bookmarks) != 1 || loaded.Bookmarks[0].Name != "orders" {
+		t.Fatalf("saved bookmarks = %#v, want orders", loaded.Bookmarks)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("config permissions = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestConfig_AddBookmark(t *testing.T) {
+	t.Parallel()
+	bookmark := Bookmark{
+		Name:       "api",
+		Type:       SessionTypeShell,
+		Profile:    "dev",
+		Region:     "us-east-1",
+		InstanceID: "i-001",
+	}
+	cfg := emptyConfig()
+	if err := cfg.AddBookmark(bookmark); err != nil {
+		t.Fatalf("AddBookmark() error = %v", err)
+	}
+	if err := cfg.AddBookmark(bookmark); err == nil {
+		t.Fatal("AddBookmark() duplicate error = nil, want error")
+	}
+}
