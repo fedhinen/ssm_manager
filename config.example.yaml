@@ -1,0 +1,12 @@
+targets:
+  - name: orders-postgres
+    profile: development
+    region: us-east-1
+    host: orders.cluster.example.us-east-1.rds.amazonaws.com
+    remote_port: 5432
+
+  - name: redis-main
+    profile: development
+    region: us-east-1
+    host: redis.example.cache.amazonaws.com
+    remote_port: 6379

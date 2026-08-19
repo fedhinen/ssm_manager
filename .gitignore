@@ -1,0 +1,9 @@
+# Local build output
+/ssm-manager
+
+# Local installers
+/AWSCLIV2.pkg
+
+# Agent-local configuration
+/.agents/
+/skills-lock.json
