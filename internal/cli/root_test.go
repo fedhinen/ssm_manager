@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"bytes"
+	"context"
 	"strings"
 	"testing"
 
@@ -35,6 +37,15 @@ func TestFilterInstances(t *testing.T) {
 	}
 }
 
+func TestIsInteractiveTerminal(t *testing.T) {
+	t.Parallel()
+	var input bytes.Buffer
+	var output bytes.Buffer
+	if isInteractiveTerminal(&input, &output) {
+		t.Fatal("isInteractiveTerminal() = true for buffers, want false")
+	}
+}
+
 func TestBookmarkLabel(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -66,5 +77,41 @@ func TestBookmarkLabel(t *testing.T) {
 				t.Errorf("bookmarkLabel() = %q, want to contain %q", got, tt.contains)
 			}
 		})
+	}
+}
+
+func TestApplicationRunBookmarkDryRun(t *testing.T) {
+	t.Parallel()
+	var output bytes.Buffer
+	app := application{out: &output, dryRun: true}
+	bookmark := appconfig.Bookmark{
+		Name: "database", Type: appconfig.SessionTypeRemoteHost,
+		Profile: "dev team", Region: "mx-central-1", InstanceID: "i-001",
+		Host: "db.internal", RemotePort: 5432, LocalPort: 15432,
+	}
+	if err := app.runBookmark(context.Background(), bookmark); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, "aws ssm start-session") || !strings.Contains(got, "'dev team'") {
+		t.Fatalf("dry-run output = %q", got)
+	}
+}
+
+func TestApplicationRunBookmarkGroupDryRun(t *testing.T) {
+	t.Parallel()
+	var output bytes.Buffer
+	app := application{out: &output, dryRun: true}
+	bookmark := appconfig.Bookmark{
+		Name: "stack", Profile: "dev", Region: "mx-central-1", InstanceID: "i-001",
+		Tunnels: []appconfig.Tunnel{
+			{Name: "db", Type: appconfig.SessionTypeRemoteHost, Host: "db.internal", RemotePort: 5432, LocalPort: 15432},
+			{Name: "redis", Type: appconfig.SessionTypeRemoteHost, Host: "redis.internal", RemotePort: 6379, LocalPort: 16379},
+		},
+	}
+	if err := app.runBookmark(context.Background(), bookmark); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(output.String(), "aws ssm start-session"); got != 2 {
+		t.Fatalf("group dry-run commands = %d, want 2: %q", got, output.String())
 	}
 }

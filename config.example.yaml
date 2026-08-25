@@ -30,3 +30,21 @@ bookmarks:
     host: orders.cluster.example.us-east-1.rds.amazonaws.com
     remote_port: 5432
     local_port: 15432
+
+  # A bookmark can start several tunnels through the same EC2 instance.
+  - name: stack-dev
+    profile: development
+    region: us-east-1
+    instance_id: i-0123456789abcdef0
+    instance_name: bastion-dev
+    tunnels:
+      - name: database
+        type: remote-host
+        host: orders.cluster.example.us-east-1.rds.amazonaws.com
+        remote_port: 5432
+        local_port: 15432
+      - name: redis
+        type: remote-host
+        host: redis.example.cache.amazonaws.com
+        remote_port: 6379
+        local_port: 16379

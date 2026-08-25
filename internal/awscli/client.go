@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 type Client struct {
@@ -21,14 +23,26 @@ type Client struct {
 	Stdin   io.Reader
 	Stdout  io.Writer
 	Stderr  io.Writer
+	events  chan ProcessEvent
+}
+
+// ProcessEvent describes lifecycle output from an external process. Consumers
+// can render these events without mixing subprocess logs with structured data.
+type ProcessEvent struct {
+	Title   string
+	Message string
+	Done    bool
+	Err     error
 }
 
 type Instance struct {
-	ID        string
-	Name      string
-	PrivateIP string
-	State     string
-	VPCID     string
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	PrivateIP    string `json:"private_ip"`
+	Type         string `json:"type"`
+	State        string `json:"state"`
+	VPCID        string `json:"vpc_id"`
+	SSMAvailable bool   `json:"ssm_available"`
 }
 
 type RemoteHost struct {
@@ -58,7 +72,27 @@ func New() (*Client, error) {
 		Stdin:   os.Stdin,
 		Stdout:  os.Stdout,
 		Stderr:  os.Stderr,
+		events:  make(chan ProcessEvent, 32),
 	}, nil
+}
+
+// ProcessEvents returns external-process lifecycle events. The channel remains
+// open for the lifetime of the client.
+func (c *Client) ProcessEvents() <-chan ProcessEvent {
+	if c.events == nil {
+		c.events = make(chan ProcessEvent, 32)
+	}
+	return c.events
+}
+
+func (c *Client) emit(event ProcessEvent) {
+	if c.events == nil {
+		return
+	}
+	select {
+	case c.events <- event:
+	default:
+	}
 }
 
 func (c *Client) Profiles(ctx context.Context) ([]string, error) {
@@ -98,16 +132,11 @@ func (c *Client) Instances(ctx context.Context, profile, region string) ([]Insta
 	if err != nil {
 		return nil, err
 	}
-	if len(managedIDs) == 0 {
-		return []Instance{}, nil
-	}
-
-	const query = "Reservations[].Instances[].[InstanceId, Tags[?Key=='Name']|[0].Value, PrivateIpAddress, State.Name, VpcId]"
+	const query = "Reservations[].Instances[].[InstanceId, Tags[?Key=='Name']|[0].Value, PrivateIpAddress, InstanceType, State.Name, VpcId]"
 	args := []string{
 		"ec2", "describe-instances",
 		"--profile", profile,
 		"--region", region,
-		"--filters", "Name=instance-state-name,Values=running",
 		"--query", query,
 		"--output", "json",
 	}
@@ -122,19 +151,21 @@ func (c *Client) Instances(ctx context.Context, profile, region string) ([]Insta
 	}
 	instances := make([]Instance, 0, len(rows))
 	for _, row := range rows {
-		if len(row) != 5 {
+		if len(row) != 6 {
 			continue
 		}
 		instance := Instance{
 			ID:        stringValue(row[0]),
 			Name:      stringValue(row[1]),
 			PrivateIP: stringValue(row[2]),
-			State:     stringValue(row[3]),
-			VPCID:     stringValue(row[4]),
+			Type:      stringValue(row[3]),
+			State:     stringValue(row[4]),
+			VPCID:     stringValue(row[5]),
 		}
 		if _, managed := managedIDs[instance.ID]; managed {
-			instances = append(instances, instance)
+			instance.SSMAvailable = true
 		}
+		instances = append(instances, instance)
 	}
 	sort.Slice(instances, func(i, j int) bool {
 		return instances[i].Name < instances[j].Name
@@ -247,7 +278,7 @@ func (c *Client) discoverDatabaseClusters(
 			subnetVPCs[stringValue(row[0])] = stringValue(row[1])
 		}
 	}
-	const query = "DBClusters[].[DBClusterIdentifier,Engine,Endpoint,Port,DBSubnetGroup]"
+	const query = "DBClusters[].[DBClusterIdentifier,Engine,Endpoint,ReaderEndpoint,Port,DBSubnetGroup]"
 	rows, err := c.outputRows(
 		ctx,
 		service, "describe-db-clusters",
@@ -261,21 +292,27 @@ func (c *Client) discoverDatabaseClusters(
 	}
 	hosts := []RemoteHost{}
 	for _, row := range rows {
-		if len(row) != 5 || stringValue(row[2]) == "" || intValue(row[3]) == 0 {
+		if len(row) != 6 || intValue(row[4]) == 0 {
 			continue
 		}
-		hostVPC := subnetVPCs[stringValue(row[4])]
+		hostVPC := subnetVPCs[stringValue(row[5])]
 		if vpcID != "" && hostVPC != vpcID {
 			continue
 		}
-		hosts = append(hosts, RemoteHost{
-			Name:    stringValue(row[0]),
-			Service: label,
-			Engine:  stringValue(row[1]),
-			Host:    stringValue(row[2]),
-			Port:    intValue(row[3]),
-			VPCID:   hostVPC,
-		})
+		endpoints := []struct {
+			suffix string
+			host   string
+		}{{suffix: " (W)", host: stringValue(row[2])}, {suffix: " (R1)", host: stringValue(row[3])}}
+		for _, endpoint := range endpoints {
+			if endpoint.host == "" {
+				continue
+			}
+			hosts = append(hosts, RemoteHost{
+				Name: stringValue(row[0]) + endpoint.suffix, Service: label,
+				Engine: stringValue(row[1]), Host: endpoint.host,
+				Port: intValue(row[4]), VPCID: hostVPC,
+			})
+		}
 	}
 	return hosts, nil
 }
@@ -597,6 +634,148 @@ func (c *Client) Shell(ctx context.Context, profile, region, instanceID string) 
 	return c.runSession(ctx, profile, region, instanceID, "", nil)
 }
 
+type SessionSpec struct {
+	Type       string
+	Profile    string
+	Region     string
+	InstanceID string
+	Host       string
+	RemotePort int
+	LocalPort  int
+}
+
+type BackgroundSession struct {
+	PID       int
+	StartedAt time.Time
+	Done      <-chan error
+	stop      func() error
+}
+
+func (s *BackgroundSession) Stop() error { return s.stop() }
+
+// NewBackgroundSession builds a process handle for alternate launchers and
+// tests without exposing the stop callback as mutable state.
+func NewBackgroundSession(
+	pid int,
+	startedAt time.Time,
+	done <-chan error,
+	stop func() error,
+) *BackgroundSession {
+	return &BackgroundSession{PID: pid, StartedAt: startedAt, Done: done, stop: stop}
+}
+
+func (c *Client) SessionCommand(ctx context.Context, spec SessionSpec) (*exec.Cmd, error) {
+	if err := c.authorizeSSOProfile(ctx, spec.Profile); err != nil {
+		return nil, err
+	}
+	args, err := SessionArguments(spec)
+	if err != nil {
+		return nil, err
+	}
+	return exec.CommandContext(ctx, c.AWSPath, args...), nil
+}
+
+// SessionArguments returns the exact AWS CLI arguments for a session.
+func SessionArguments(spec SessionSpec) ([]string, error) {
+	args := []string{"ssm", "start-session", "--profile", spec.Profile, "--region", spec.Region, "--target", spec.InstanceID}
+	var document string
+	var parameters map[string][]string
+	switch spec.Type {
+	case "shell":
+	case "port-forward":
+		document = "AWS-StartPortForwardingSession"
+		parameters = map[string][]string{"portNumber": {strconv.Itoa(spec.RemotePort)}, "localPortNumber": {strconv.Itoa(spec.LocalPort)}}
+	case "remote-host":
+		document = "AWS-StartPortForwardingSessionToRemoteHost"
+		parameters = map[string][]string{"host": {spec.Host}, "portNumber": {strconv.Itoa(spec.RemotePort)}, "localPortNumber": {strconv.Itoa(spec.LocalPort)}}
+	default:
+		return nil, fmt.Errorf("unsupported session type %q", spec.Type)
+	}
+	if document != "" {
+		encoded, err := json.Marshal(parameters)
+		if err != nil {
+			return nil, fmt.Errorf("encoding session parameters: %w", err)
+		}
+		args = append(args, "--document-name", document, "--parameters", string(encoded))
+	}
+	return args, nil
+}
+
+// SessionCommandString returns a shell-safe, copyable equivalent command.
+func SessionCommandString(spec SessionSpec) (string, error) {
+	args, err := SessionArguments(spec)
+	if err != nil {
+		return "", err
+	}
+	quoted := make([]string, 0, len(args)+1)
+	quoted = append(quoted, "aws")
+	for _, arg := range args {
+		quoted = append(quoted, shellQuote(arg))
+	}
+	return strings.Join(quoted, " "), nil
+}
+
+func (c *Client) authorizeSSOProfile(ctx context.Context, profile string) error {
+	if profile == "" {
+		return nil
+	}
+	for _, key := range []string{"sso_session", "sso_start_url"} {
+		output, err := c.runOutput(ctx, "configure", "get", key, "--profile", profile)
+		if err == nil && strings.TrimSpace(string(output)) != "" {
+			_, err = c.output(ctx, "sts", "get-caller-identity", "--profile", profile, "--output", "json")
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) StartBackground(ctx context.Context, spec SessionSpec) (*BackgroundSession, error) {
+	// The caller decides whether this session outlives its parent operation.
+	// The ssm.Manager passes a detached parent with an individual cancel branch.
+	sessionCtx, cancel := context.WithCancel(ctx)
+	cmd, err := c.SessionCommand(sessionCtx, spec)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	cmd.Stdin = nil
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	configureDetached(cmd)
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("starting session: %w", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		if isNormalSessionExit(err) {
+			err = nil
+		}
+		done <- err
+		close(done)
+		cancel()
+	}()
+	var once sync.Once
+	return &BackgroundSession{PID: cmd.Process.Pid, StartedAt: time.Now(), Done: done, stop: func() error {
+		var stopErr error
+		once.Do(func() {
+			stopErr = stopProcess(cmd)
+			if stopErr != nil {
+				return
+			}
+			// aws may leave the session-manager-plugin child alive after the
+			// interrupt. Give the whole process group a short grace period,
+			// then terminate it so the Done event cannot remain pending forever.
+			go func() {
+				time.Sleep(750 * time.Millisecond)
+				forceKillProcess(cmd)
+			}()
+		})
+		return stopErr
+	}}, nil
+}
+
 func (c *Client) Forward(
 	ctx context.Context,
 	profile string,
@@ -651,21 +830,26 @@ func (c *Client) runSession(
 	document string,
 	parameters map[string][]string,
 ) error {
-	args := []string{
-		"ssm", "start-session",
-		"--profile", profile,
-		"--region", region,
-		"--target", instanceID,
+	spec := SessionSpec{Type: "shell", Profile: profile, Region: region, InstanceID: instanceID}
+	if document == "AWS-StartPortForwardingSession" {
+		spec.Type = "port-forward"
 	}
-	if document != "" {
-		encoded, err := json.Marshal(parameters)
-		if err != nil {
-			return fmt.Errorf("encoding session parameters: %w", err)
-		}
-		args = append(args, "--document-name", document, "--parameters", string(encoded))
+	if document == "AWS-StartPortForwardingSessionToRemoteHost" {
+		spec.Type = "remote-host"
 	}
-
-	cmd := exec.CommandContext(ctx, c.AWSPath, args...)
+	if values := parameters["host"]; len(values) > 0 {
+		spec.Host = values[0]
+	}
+	if values := parameters["portNumber"]; len(values) > 0 {
+		spec.RemotePort, _ = strconv.Atoi(values[0])
+	}
+	if values := parameters["localPortNumber"]; len(values) > 0 {
+		spec.LocalPort, _ = strconv.Atoi(values[0])
+	}
+	cmd, err := c.SessionCommand(ctx, spec)
+	if err != nil {
+		return err
+	}
 	cmd.Stdin = c.Stdin
 	cmd.Stdout = c.Stdout
 	cmd.Stderr = c.Stderr
@@ -721,6 +905,10 @@ func isNormalSessionExit(err error) bool {
 	return exitError.ExitCode() == 1 || exitError.ExitCode() == 130
 }
 
+// IsNormalSessionExit reports the exit statuses emitted by the Session Manager
+// plugin when a user closes an otherwise healthy session.
+func IsNormalSessionExit(err error) bool { return isNormalSessionExit(err) }
+
 func (c *Client) outputRows(ctx context.Context, args ...string) ([][]any, error) {
 	output, err := c.output(ctx, args...)
 	if err != nil {
@@ -734,6 +922,22 @@ func (c *Client) outputRows(ctx context.Context, args ...string) ([][]any, error
 }
 
 func (c *Client) output(ctx context.Context, args ...string) ([]byte, error) {
+	output, err := c.runOutput(ctx, args...)
+	if err == nil || !isExpiredSSOSession(err.Error()) {
+		return output, err
+	}
+
+	profile := argumentValue(args, "--profile")
+	if profile == "" {
+		return nil, err
+	}
+	if loginErr := c.ssoLogin(ctx, profile); loginErr != nil {
+		return nil, fmt.Errorf("authorizing SSO profile %q: %w", profile, loginErr)
+	}
+	return c.runOutput(ctx, args...)
+}
+
+func (c *Client) runOutput(ctx context.Context, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, c.AWSPath, args...)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -747,6 +951,52 @@ func (c *Client) output(ctx context.Context, args ...string) ([]byte, error) {
 		return nil, errors.New(message)
 	}
 	return stdout.Bytes(), nil
+}
+
+func (c *Client) ssoLogin(ctx context.Context, profile string) error {
+	cmd := exec.CommandContext(ctx, c.AWSPath, "sso", "login", "--profile", profile)
+	cmd.Stdin = c.Stdin
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	c.emit(ProcessEvent{Title: "Autorización AWS SSO", Message: "Esperando autorización SSO en el navegador…"})
+	err := cmd.Run()
+	log := strings.TrimSpace(output.String())
+	if log != "" {
+		c.emit(ProcessEvent{Title: "Autorización AWS SSO", Message: log})
+	}
+	c.emit(ProcessEvent{Title: "Autorización AWS SSO", Done: true, Err: err})
+	if err != nil {
+		return fmt.Errorf("aws sso login: %w", err)
+	}
+	return nil
+}
+
+func shellQuote(value string) string {
+	if value != "" && !strings.ContainsAny(value, " \t\n'\"\\$`()<>|;&*?![]{}") {
+		return value
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\\\"'\\\"'") + "'"
+}
+
+func isExpiredSSOSession(message string) bool {
+	message = strings.ToLower(message)
+	if !strings.Contains(message, "sso") {
+		return false
+	}
+	return strings.Contains(message, "expired") ||
+		strings.Contains(message, "invalid") ||
+		strings.Contains(message, "error loading sso token") ||
+		strings.Contains(message, "token does not exist")
+}
+
+func argumentValue(args []string, name string) string {
+	for index := 0; index+1 < len(args); index++ {
+		if args[index] == name {
+			return args[index+1]
+		}
+	}
+	return ""
 }
 
 func stringValue(value any) string {

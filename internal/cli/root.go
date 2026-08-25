@@ -7,12 +7,18 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
+	appaws "github.com/victorruiz/ssm-manager/internal/aws"
 	"github.com/victorruiz/ssm-manager/internal/awscli"
+	"github.com/victorruiz/ssm-manager/internal/cache"
 	appconfig "github.com/victorruiz/ssm-manager/internal/config"
+	"github.com/victorruiz/ssm-manager/internal/ssm"
+	appTUI "github.com/victorruiz/ssm-manager/internal/tui"
 )
 
 type sessionClient interface {
@@ -23,17 +29,28 @@ type sessionClient interface {
 	Shell(context.Context, string, string, string) error
 	Forward(context.Context, string, string, string, int, int) error
 	ForwardHost(context.Context, string, string, string, string, int, int) error
+	SessionCommand(context.Context, awscli.SessionSpec) (*exec.Cmd, error)
+	StartBackground(context.Context, awscli.SessionSpec) (*awscli.BackgroundSession, error)
 }
 
 type application struct {
 	client     sessionClient
 	prompter   *Prompter
+	in         io.Reader
 	out        io.Writer
 	configPath string
+	plain      bool
+	dryRun     bool
+	noColor    bool
+	cacheTTL   time.Duration
 }
 
 func NewRootCommand() *cobra.Command {
 	var configPath string
+	var plain bool
+	var dryRun bool
+	var noColor bool
+	var cacheTTL time.Duration
 	defaultConfigPath, _ := appconfig.DefaultPath()
 
 	cmd := &cobra.Command{
@@ -47,11 +64,18 @@ func NewRootCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			in := cmd.InOrStdin()
+			out := cmd.OutOrStdout()
 			app := application{
 				client:     client,
-				prompter:   NewPrompter(cmd.InOrStdin(), cmd.OutOrStdout()),
-				out:        cmd.OutOrStdout(),
+				prompter:   NewPrompter(in, out),
+				in:         in,
+				out:        out,
 				configPath: configPath,
+				plain:      plain || !isInteractiveTerminal(in, out),
+				dryRun:     dryRun,
+				noColor:    noColor,
+				cacheTTL:   cacheTTL,
 			}
 			return app.run(cmd.Context())
 		},
@@ -60,6 +84,10 @@ func NewRootCommand() *cobra.Command {
 	cmd.SetOut(os.Stdout)
 	cmd.SetErr(os.Stderr)
 	cmd.Flags().StringVar(&configPath, "config", defaultConfigPath, "path to the YAML configuration file")
+	cmd.Flags().BoolVar(&plain, "plain", false, "use numbered prompts instead of the terminal UI")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the exact AWS command without starting a session")
+	cmd.Flags().BoolVar(&noColor, "no-color", false, "disable colors and terminal styling")
+	cmd.Flags().DurationVar(&cacheTTL, "cache-ttl", 5*time.Minute, "instance and resource cache lifetime")
 	return cmd
 }
 
@@ -67,6 +95,9 @@ func (a application) run(ctx context.Context) error {
 	cfg, err := appconfig.Load(a.configPath)
 	if err != nil {
 		return err
+	}
+	if !a.plain {
+		return a.runTUI(ctx, cfg)
 	}
 	modeOptions := []string{"Explore dynamically"}
 	if len(cfg.Bookmarks) > 0 {
@@ -91,7 +122,23 @@ func (a application) run(ctx context.Context) error {
 	if err := a.runBookmark(ctx, bookmark); err != nil {
 		return err
 	}
-	return a.offerBookmark(cfg, bookmark)
+	return nil
+}
+
+func (a application) runTUI(ctx context.Context, cfg appconfig.Config) error {
+	client, ok := a.client.(*awscli.Client)
+	if !ok {
+		return appTUI.Run(ctx, a.client, cfg, a.configPath, a.dryRun, a.in, a.out)
+	}
+	store, err := cache.New("ssm-manager", a.cacheTTL)
+	if err != nil {
+		return err
+	}
+	return appTUI.RunWithOptions(ctx, appTUI.Options{
+		Inventory: appaws.NewService(client, appaws.DefaultConfigPath()),
+		Sessions:  ssm.NewManager(client), Cache: store, NoColor: a.noColor,
+		Input: a.in, Output: a.out, DryRun: a.dryRun,
+	})
 }
 
 func (a application) buildDynamicSession(
@@ -289,14 +336,34 @@ func (a application) chooseBookmark(bookmarks []appconfig.Bookmark) (appconfig.B
 }
 
 func (a application) runBookmark(ctx context.Context, bookmark appconfig.Bookmark) error {
-	if bookmark.Type != appconfig.SessionTypeShell {
-		if err := ensureLocalPortAvailable(bookmark.LocalPort); err != nil {
-			return err
-		}
+	if len(bookmark.Tunnels) > 0 {
+		return a.runBookmarkGroup(ctx, bookmark)
 	}
 	instanceName := bookmark.InstanceName
 	if instanceName == "" {
 		instanceName = bookmark.InstanceID
+	}
+	spec := awscli.SessionSpec{
+		Type:       string(bookmark.Type),
+		Profile:    bookmark.Profile,
+		Region:     bookmark.Region,
+		InstanceID: bookmark.InstanceID,
+		Host:       bookmark.Host,
+		RemotePort: bookmark.RemotePort,
+		LocalPort:  bookmark.LocalPort,
+	}
+	if a.dryRun {
+		command, err := awscli.SessionCommandString(spec)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(a.out, command)
+		return nil
+	}
+	if bookmark.Type != appconfig.SessionTypeShell {
+		if err := ensureLocalPortAvailable(bookmark.LocalPort); err != nil {
+			return err
+		}
 	}
 	fmt.Fprintf(a.out, "\nStarting %s through %s...\n", bookmark.Type, instanceName)
 
@@ -334,23 +401,68 @@ func (a application) runBookmark(ctx context.Context, bookmark appconfig.Bookmar
 	}
 }
 
-func (a application) offerBookmark(cfg appconfig.Config, bookmark appconfig.Bookmark) error {
-	save, err := a.prompter.Confirm("Save this session as a bookmark?", false)
-	if err != nil || !save {
-		return err
+func (a application) runBookmarkGroup(ctx context.Context, bookmark appconfig.Bookmark) error {
+	specs := make([]awscli.SessionSpec, 0, len(bookmark.Tunnels))
+	seenPorts := map[int]struct{}{}
+	for _, tunnel := range bookmark.Tunnels {
+		if _, duplicate := seenPorts[tunnel.LocalPort]; duplicate {
+			return fmt.Errorf("local port %d is repeated in bookmark %q", tunnel.LocalPort, bookmark.Name)
+		}
+		seenPorts[tunnel.LocalPort] = struct{}{}
+		spec := awscli.SessionSpec{
+			Type: string(tunnel.Type), Profile: bookmark.Profile, Region: bookmark.Region,
+			InstanceID: bookmark.InstanceID, Host: tunnel.Host,
+			RemotePort: tunnel.RemotePort, LocalPort: tunnel.LocalPort,
+		}
+		specs = append(specs, spec)
 	}
-	name, err := a.prompter.Text("Bookmark name", "")
-	if err != nil {
-		return err
+	if a.dryRun {
+		for _, spec := range specs {
+			command, err := awscli.SessionCommandString(spec)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(a.out, command)
+		}
+		return nil
 	}
-	bookmark.Name = strings.TrimSpace(name)
-	if err := cfg.AddBookmark(bookmark); err != nil {
-		return err
+	for _, spec := range specs {
+		if err := ensureLocalPortAvailable(spec.LocalPort); err != nil {
+			return err
+		}
 	}
-	if err := appconfig.Save(a.configPath, cfg); err != nil {
-		return err
+	sessions := make([]*awscli.BackgroundSession, 0, len(specs))
+	for _, spec := range specs {
+		session, err := a.client.StartBackground(ctx, spec)
+		if err != nil {
+			for _, started := range sessions {
+				_ = started.Stop()
+			}
+			return err
+		}
+		sessions = append(sessions, session)
+		fmt.Fprintf(a.out, "Started localhost:%d (PID %d)\n", spec.LocalPort, session.PID)
 	}
-	fmt.Fprintf(a.out, "Bookmark %q saved in %s\n", bookmark.Name, a.configPath)
+	done := make(chan error, len(sessions))
+	for _, session := range sessions {
+		go func() { done <- <-session.Done }()
+	}
+	for range sessions {
+		select {
+		case <-ctx.Done():
+			for _, session := range sessions {
+				_ = session.Stop()
+			}
+			return ctx.Err()
+		case err := <-done:
+			if err != nil {
+				for _, session := range sessions {
+					_ = session.Stop()
+				}
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -408,4 +520,21 @@ func ensureLocalPortAvailable(port int) error {
 		return fmt.Errorf("checking local port %d: %w", port, err)
 	}
 	return nil
+}
+
+func isInteractiveTerminal(in io.Reader, out io.Writer) bool {
+	inFile, inputIsFile := in.(*os.File)
+	outFile, outputIsFile := out.(*os.File)
+	if !inputIsFile || !outputIsFile {
+		return false
+	}
+	inInfo, err := inFile.Stat()
+	if err != nil {
+		return false
+	}
+	outInfo, err := outFile.Stat()
+	if err != nil {
+		return false
+	}
+	return inInfo.Mode()&os.ModeCharDevice != 0 && outInfo.Mode()&os.ModeCharDevice != 0
 }

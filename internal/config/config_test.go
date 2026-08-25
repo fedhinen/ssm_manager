@@ -103,3 +103,26 @@ func TestConfig_AddBookmark(t *testing.T) {
 		t.Fatal("AddBookmark() duplicate error = nil, want error")
 	}
 }
+
+func TestSaveMultiTunnelBookmark(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	cfg := emptyConfig()
+	cfg.Bookmarks = append(cfg.Bookmarks, Bookmark{
+		Name: "stack-dev", Profile: "dev", Region: "us-east-1", InstanceID: "i-001",
+		Tunnels: []Tunnel{
+			{Name: "database", Type: SessionTypeRemoteHost, Host: "db.internal", RemotePort: 5432, LocalPort: 15432},
+			{Name: "redis", Type: SessionTypeRemoteHost, Host: "redis.internal", RemotePort: 6379, LocalPort: 16379},
+		},
+	})
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(loaded.Bookmarks[0].Tunnels); got != 2 {
+		t.Fatalf("loaded tunnels = %d, want 2", got)
+	}
+}

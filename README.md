@@ -21,16 +21,39 @@ go build -o ssm-manager ./cmd/ssm-manager
 ./ssm-manager
 ```
 
-At startup, choose between dynamic exploration and saved bookmarks. Dynamic
-exploration selects an AWS profile, enabled region, running EC2 instance online
-in SSM, and one of:
+## Terminal UI
+
+Interactive terminals use a drill-down view stack: profile, optional region,
+instances, action overlay, and remote-resource scan. AWS requests run in the
+background and the UI remains responsive.
+
+- `j`/`k` or up/down moves the current selection; `Enter` selects
+- `Esc` pops the current view
+- `/` starts fuzzy filtering without disabling the other instance shortcuts
+- `p` opens direct port forwarding; `r` scans remote resources
+- `Tab` toggles the active-session split without replacing the current view
+- `x` kills the selected session while that split is visible
+- `Ctrl+R` bypasses the cache and refreshes the current inventory
+- `q` exits from the instance list
+
+The theme follows the terminal's light/dark background and detected color
+profile, degrading from TrueColor to ANSI. `NO_COLOR`, `--no-color`, and
+`TERM=dumb` produce an unstyled text fallback. Rounded borders are used only
+when styling is available. The minimum supported size is `80x24`.
+When stdin or stdout is redirected, the CLI automatically falls back to numbered
+prompts so ANSI control sequences never leak into pipelines. Use `--plain` to
+request that mode explicitly.
+
+Select an AWS profile, enabled region, and running EC2 instance online in SSM,
+then start one of:
 
 1. Interactive terminal
 2. Port forwarding to the selected instance
 3. Port forwarding through the instance to a remote host
 
-Instances can be filtered by Name tag, instance ID, or private IP. After a
-dynamic session ends, the CLI offers to save the complete session as a bookmark.
+Instances can be filtered by Name tag, instance ID, or private IP. Every session
+is added to persistent history. Bookmarks are created explicitly from that
+history instead of being prompted when a session closes.
 
 ## Remote-host discovery
 
@@ -63,6 +86,17 @@ Existing manual targets are preserved.
 
 Targets with an empty `profile` or `region` apply to every profile or region.
 Bookmarks support `shell`, `port-forward`, and `remote-host` session types.
+They may also contain a `tunnels` list; every entry is started concurrently
+through the bookmark's instance and grouped under its name in the sessions
+panel. See `config.example.yaml` for the format.
+
+Use `--dry-run` to print (plain mode) or preview (TUI) the exact shell-safe AWS
+CLI command without starting a session. This also previews every command in a
+multi-tunnel bookmark.
+
+Instance and remote-resource responses are cached under the user's cache
+directory. Set the lifetime with `--cache-ttl` (default `5m`) and use `Ctrl+R`
+for a manual refresh.
 
 ## IAM read permissions
 

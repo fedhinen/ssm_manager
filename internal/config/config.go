@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -12,6 +13,7 @@ import (
 type Config struct {
 	Targets   []Target   `yaml:"targets,omitempty"`
 	Bookmarks []Bookmark `yaml:"bookmarks,omitempty"`
+	History   []History  `yaml:"history,omitempty"`
 }
 
 type SessionType string
@@ -32,6 +34,32 @@ type Bookmark struct {
 	Host         string      `yaml:"host,omitempty"`
 	RemotePort   int         `yaml:"remote_port,omitempty"`
 	LocalPort    int         `yaml:"local_port,omitempty"`
+	Tunnels      []Tunnel    `yaml:"tunnels,omitempty"`
+}
+
+// Tunnel is one connection in a multi-tunnel bookmark. It inherits the
+// bookmark's AWS profile, region and EC2 instance.
+type Tunnel struct {
+	Name       string      `yaml:"name,omitempty"`
+	Type       SessionType `yaml:"type"`
+	Host       string      `yaml:"host,omitempty"`
+	RemotePort int         `yaml:"remote_port"`
+	LocalPort  int         `yaml:"local_port"`
+}
+
+type History struct {
+	ID           string      `yaml:"id"`
+	Type         SessionType `yaml:"type"`
+	Profile      string      `yaml:"profile"`
+	Region       string      `yaml:"region"`
+	InstanceID   string      `yaml:"instance_id"`
+	InstanceName string      `yaml:"instance_name,omitempty"`
+	Host         string      `yaml:"host,omitempty"`
+	RemotePort   int         `yaml:"remote_port,omitempty"`
+	LocalPort    int         `yaml:"local_port,omitempty"`
+	StartedAt    time.Time   `yaml:"started_at"`
+	EndedAt      *time.Time  `yaml:"ended_at,omitempty"`
+	Status       string      `yaml:"status"`
 }
 
 type Target struct {
@@ -68,6 +96,9 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Bookmarks == nil {
 		cfg.Bookmarks = []Bookmark{}
+	}
+	if cfg.History == nil {
+		cfg.History = []History{}
 	}
 	for _, target := range cfg.Targets {
 		if err := validateTarget(target); err != nil {
@@ -137,6 +168,29 @@ func (c *Config) AddBookmark(bookmark Bookmark) error {
 	return nil
 }
 
+func (c *Config) AddHistory(entry History) {
+	c.History = append([]History{entry}, c.History...)
+	if len(c.History) > 100 {
+		c.History = c.History[:100]
+	}
+}
+
+func (c *Config) FinishHistory(id, status string, endedAt time.Time) {
+	for index := range c.History {
+		if c.History[index].ID == id {
+			c.History[index].Status = status
+			c.History[index].EndedAt = &endedAt
+			return
+		}
+	}
+}
+
+func (h History) Bookmark(name string) Bookmark {
+	return Bookmark{Name: name, Type: h.Type, Profile: h.Profile, Region: h.Region,
+		InstanceID: h.InstanceID, InstanceName: h.InstanceName, Host: h.Host,
+		RemotePort: h.RemotePort, LocalPort: h.LocalPort}
+}
+
 func (c Config) TargetsFor(profile, region string) []Target {
 	targets := []Target{}
 	for _, target := range c.Targets {
@@ -169,6 +223,23 @@ func validateBookmark(bookmark Bookmark) error {
 	if bookmark.Profile == "" || bookmark.Region == "" || bookmark.InstanceID == "" {
 		return fmt.Errorf("bookmark %q requires profile, region, and instance_id", bookmark.Name)
 	}
+	if len(bookmark.Tunnels) > 0 {
+		for _, tunnel := range bookmark.Tunnels {
+			if tunnel.Type != SessionTypeForward && tunnel.Type != SessionTypeRemoteHost {
+				return fmt.Errorf("bookmark %q tunnel %q has invalid type %q", bookmark.Name, tunnel.Name, tunnel.Type)
+			}
+			if tunnel.Type == SessionTypeRemoteHost && tunnel.Host == "" {
+				return fmt.Errorf("bookmark %q tunnel %q requires host", bookmark.Name, tunnel.Name)
+			}
+			candidate := bookmark
+			candidate.RemotePort = tunnel.RemotePort
+			candidate.LocalPort = tunnel.LocalPort
+			if err := validateBookmarkPorts(candidate); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	switch bookmark.Type {
 	case SessionTypeShell:
 		return nil
@@ -197,5 +268,6 @@ func emptyConfig() Config {
 	return Config{
 		Targets:   []Target{},
 		Bookmarks: []Bookmark{},
+		History:   []History{},
 	}
 }

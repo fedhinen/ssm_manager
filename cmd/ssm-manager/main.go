@@ -5,12 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/victorruiz/ssm-manager/internal/cli"
 )
 
 func main() {
-	if err := cli.NewRootCommand().ExecuteContext(context.Background()); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := cli.NewRootCommand().ExecuteContext(ctx); err != nil {
 		if !errors.Is(err, context.Canceled) {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 		}
