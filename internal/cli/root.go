@@ -19,6 +19,7 @@ import (
 	appconfig "github.com/victorruiz/ssm-manager/internal/config"
 	"github.com/victorruiz/ssm-manager/internal/ssm"
 	appTUI "github.com/victorruiz/ssm-manager/internal/tui"
+	appversion "github.com/victorruiz/ssm-manager/internal/version"
 )
 
 type sessionClient interface {
@@ -56,6 +57,7 @@ func NewRootCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:           "ssm-manager",
 		Short:         "Connect to EC2 instances using AWS Systems Manager",
+		Version:       appversion.Version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Args:          cobra.NoArgs,
