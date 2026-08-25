@@ -21,6 +21,16 @@ go build -o ssm-manager ./cmd/ssm-manager
 ./ssm-manager
 ```
 
+To print the embedded version:
+
+```sh
+./ssm-manager --version
+```
+
+Unreleased local builds report `dev`. Stable release binaries are published
+from merged pull requests to `main` and are available from the repository's
+GitHub Releases page.
+
 ## Terminal UI
 
 Interactive terminals use a drill-down view stack: profile, optional region,
@@ -110,3 +120,21 @@ The exact policy can be narrowed to your environment. Discovery may call:
   `docdb:DescribeDBSubnetGroups`
 - `elasticache:DescribeCacheClusters`, `elasticache:DescribeCacheSubnetGroups`
 - `mq:ListBrokers`, `mq:DescribeBroker`
+
+## Development
+
+Create a development branch from `dev` or `main`, then run the test suite
+before opening a pull request:
+
+```sh
+go test ./...
+```
+
+Pull requests should explain the user-visible change, include tests for new
+behavior where practical, and keep unrelated refactors out of the same
+change. See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete workflow.
+
+## License
+
+ssm-manager is distributed under the GNU General Public License, version 3 or
+later. See [LICENSE](LICENSE).
